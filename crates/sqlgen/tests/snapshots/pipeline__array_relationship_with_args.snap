@@ -1,0 +1,6 @@
+---
+source: crates/sqlgen/tests/pipeline.rs
+assertion_line: 136
+expression: "plan_sql(r#\"query {\n            author {\n                id\n                articles(where: { title: { _like: \"%rust%\" } }, order_by: { id: asc }) {\n                    title\n                }\n            }\n        }\"#)"
+---
+SELECT json_build_object('author', (SELECT coalesce(json_agg("_t3".j), '[]'::json) FROM (SELECT json_build_object('id', "_t0"."id", 'articles', (SELECT coalesce(json_agg("_t2".j), '[]'::json) FROM (SELECT json_build_object('title', "_t1"."title") AS j FROM "public"."article" AS "_t1" WHERE "_t1"."author_id" = "_t0"."id" AND ("_t1"."title" LIKE ('%rust%')::"text" AND ("_t1"."published" = TRUE OR "_t1"."author_id" = ('1')::"int4")) ORDER BY "_t1"."id" ASC NULLS LAST LIMIT 100) AS "_t2")) AS j FROM "public"."author" AS "_t0" WHERE "_t0"."id" = ('1')::"int4") AS "_t3")) AS root

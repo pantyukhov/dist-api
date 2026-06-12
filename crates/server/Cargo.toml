@@ -1,0 +1,32 @@
+[package]
+name = "dist-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "HTTP server exposing the Hasura v2 API surface (/v1/graphql, /healthz, /v1/version)"
+
+[[bin]]
+name = "dist-api"
+path = "src/main.rs"
+
+[dependencies]
+dist-metadata = { path = "../metadata" }
+dist-catalog = { path = "../catalog" }
+dist-schema = { path = "../schema" }
+dist-ir = { path = "../ir" }
+dist-sqlgen = { path = "../sqlgen" }
+graphql-parser = { workspace = true }
+tokio-postgres = { workspace = true }
+deadpool-postgres = { workspace = true }
+jsonwebtoken = { workspace = true }
+reqwest = { workspace = true }
+futures-util = { workspace = true }
+serde_yaml = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

@@ -1,0 +1,6 @@
+---
+source: crates/sqlgen/tests/pipeline.rs
+assertion_line: 177
+expression: "plan_sql(\"query { author_by_pk(id: 7) { id name } }\")"
+---
+SELECT json_build_object('author_by_pk', (SELECT json_build_object('id', "_t0"."id", 'name', "_t0"."name") FROM "public"."author" AS "_t0" WHERE ("_t0"."id" = (7)::"int4" AND "_t0"."id" = ('1')::"int4") LIMIT 1)) AS root

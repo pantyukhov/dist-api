@@ -1,0 +1,16 @@
+[package]
+name = "dist-schema"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Planner: GraphQL operation + metadata + catalog -> IR, with permissions applied"
+
+[dependencies]
+dist-metadata = { path = "../metadata" }
+dist-catalog = { path = "../catalog" }
+dist-ir = { path = "../ir" }
+graphql-parser = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+base64 = { workspace = true }

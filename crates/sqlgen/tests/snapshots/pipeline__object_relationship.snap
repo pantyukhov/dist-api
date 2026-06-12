@@ -1,0 +1,6 @@
+---
+source: crates/sqlgen/tests/pipeline.rs
+assertion_line: 129
+expression: "plan_sql(\"query { article { id author { name } } }\")"
+---
+SELECT json_build_object('article', (SELECT coalesce(json_agg("_t2".j), '[]'::json) FROM (SELECT json_build_object('id', "_t0"."id", 'author', (SELECT json_build_object('name', "_t1"."name") FROM "public"."author" AS "_t1" WHERE "_t1"."id" = "_t0"."author_id" AND "_t1"."id" = ('1')::"int4" LIMIT 1)) AS j FROM "public"."article" AS "_t0" WHERE ("_t0"."published" = TRUE OR "_t0"."author_id" = ('1')::"int4") LIMIT 100) AS "_t2")) AS root

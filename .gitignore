@@ -1,0 +1,10 @@
+/target
+**/*.rs.bk
+.env
+__pycache__/
+*.pyc
+.venv/
+# Vendored Hasura test suite — not committed; see tests/hasura/README.md
+tests/hasura/tests-py/
+.DS_Store
+*.log

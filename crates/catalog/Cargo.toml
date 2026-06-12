@@ -1,0 +1,10 @@
+[package]
+name = "dist-catalog"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Postgres introspection: tables, columns, types, PKs and FKs from pg_catalog"
+
+[dependencies]
+serde = { workspace = true }
+tokio-postgres = { workspace = true }

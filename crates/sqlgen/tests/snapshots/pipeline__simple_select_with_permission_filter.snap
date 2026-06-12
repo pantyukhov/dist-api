@@ -1,0 +1,6 @@
+---
+source: crates/sqlgen/tests/pipeline.rs
+assertion_line: 111
+expression: "plan_sql(\"query { author { id name } }\")"
+---
+SELECT json_build_object('author', (SELECT coalesce(json_agg("_t1".j), '[]'::json) FROM (SELECT json_build_object('id', "_t0"."id", 'name', "_t0"."name") AS j FROM "public"."author" AS "_t0" WHERE "_t0"."id" = ('1')::"int4") AS "_t1")) AS root

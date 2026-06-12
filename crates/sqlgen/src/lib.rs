@@ -1,0 +1,1013 @@
+//! SQL generation (milestone M4) — the core trick of Hasura v2.
+//!
+//! Compiles a whole operation (all root fields) into ONE Postgres statement
+//! that returns the final GraphQL `data` object as a single `json` value.
+//! `json` (not `jsonb`) everywhere: it preserves key insertion order, which
+//! the conformance suite asserts against the selection-set order.
+//!
+//! Literals are inlined with strict quoting (`'` doubling; Postgres has
+//! `standard_conforming_strings = on` by default, so backslashes are inert)
+//! and cast to the column's pg type. Parameterized execution can replace
+//! this later without touching the IR.
+
+use dist_ir::*;
+
+/// Compile one operation: `SELECT json_build_object('field1', (...), ...)`.
+pub fn operation_to_sql(roots: &[RootField]) -> String {
+    operation_to_sql_opts(roots, false)
+}
+
+/// `stringify_numerics` renders bigint/numeric columns as text
+/// (Hasura's --stringify-numeric-types).
+pub fn operation_to_sql_opts(roots: &[RootField], stringify_numerics: bool) -> String {
+    let mut ctx = Ctx { next_alias: 0, stringify_numerics };
+    let pairs: Vec<String> = roots
+        .iter()
+        .map(|r| match r {
+            RootField::Select { alias, query } => {
+                format!("{}, {}", quote_lit(alias), ctx.select_expr(query, None))
+            }
+            RootField::Connection { alias, conn } => {
+                format!("{}, {}", quote_lit(alias), ctx.connection_expr(conn, None))
+            }
+            RootField::Typename { alias, value } => {
+                format!("{}, {}::text", quote_lit(alias), quote_lit(value))
+            }
+        })
+        .collect();
+    format!("SELECT json_build_object({}) AS root", pairs.join(", "))
+}
+
+/// base64 without the newlines Postgres' encode() inserts.
+fn b64(expr: &str) -> String {
+    format!("replace(encode(convert_to({expr}, 'UTF8'), 'base64'), chr(10), '')")
+}
+
+struct Ctx {
+    next_alias: usize,
+    stringify_numerics: bool,
+}
+
+/// Join condition pairs against an enclosing table alias:
+/// (local column on the outer table, remote column on the inner table).
+type OuterJoin<'a> = (&'a [(String, String)], &'a str);
+
+impl Ctx {
+    fn alias(&mut self) -> String {
+        let n = self.next_alias;
+        self.next_alias += 1;
+        format!("_t{n}")
+    }
+
+    /// Relay cursor for the current row: base64 of {"pk" : v}.
+    fn cursor_expr(&mut self, alias: &str, pk: &[(String, String)]) -> String {
+        let pairs: Vec<String> = pk
+            .iter()
+            .map(|(col, _)| {
+                format!(
+                    "{} || to_json({})::text",
+                    quote_lit(&format!("\"{col}\" : ")),
+                    qualified(alias, col)
+                )
+            })
+            .collect();
+        let body = pairs.join(" || ', ' || ");
+        b64(&format!("'{{' || {body} || '}}'"))
+    }
+
+    /// Relay global id: base64 of [1, "schema", "table", pk...].
+    fn global_id_expr(
+        &mut self,
+        alias: &str,
+        schema: &str,
+        table: &str,
+        pk: &[(String, String)],
+    ) -> String {
+        let mut parts = vec![format!(
+            "'[1, \"{schema}\", \"{table}\"'"
+        )];
+        for (col, _) in pk {
+            parts.push(format!("', ' || to_json({})::text", qualified(alias, col)));
+        }
+        let body = parts.join(" || ");
+        b64(&format!("{body} || ']'"))
+    }
+
+    /// A parenthesized scalar subquery producing a connection's JSON value.
+    fn connection_expr(&mut self, conn: &Connection, outer: Option<OuterJoin>) -> String {
+        let alias = self.alias();
+        let row_json = self.row_json(&conn.query.fields, &alias);
+        let cursor = self.cursor_expr(&alias, &conn.pk);
+
+        // Deterministic ordering: append pk (reversed when paging back).
+        let mut q = conn.query.clone();
+        let backward = conn.page.as_ref().is_some_and(|p| p.backward);
+        for (col, _) in &conn.pk {
+            if !q.order_by.iter().any(
+                |ob| matches!(&ob.target, OrderByTarget::Column(c) if c == col),
+            ) {
+                q.order_by.push(OrderBy {
+                    target: OrderByTarget::Column(col.clone()),
+                    direction: if backward {
+                        OrderDirection::Desc
+                    } else {
+                        OrderDirection::Asc
+                    },
+                    nulls: NullsOrder::Last,
+                });
+            }
+        }
+        if let Some(page) = &conn.page {
+            q.limit = Some(page.size + 1);
+        }
+        let tail = self.from_where_order(&q, &alias, outer);
+
+        let arr = self.alias();
+        let raw = format!("{}.a", quote_ident(&arr));
+        // The visible page: size rows of the size+1 fetched, re-reversed
+        // for backward iteration.
+        let a = match &conn.page {
+            None => raw.clone(),
+            Some(page) => {
+                let order = if page.backward { "t.i DESC" } else { "t.i ASC" };
+                format!(
+                    "(SELECT coalesce(json_agg(t.e ORDER BY {order}), '[]'::json) FROM json_array_elements({raw}) WITH ORDINALITY AS t(e, i) WHERE t.i <= {size})",
+                    size = page.size
+                )
+            }
+        };
+        let has_more = format!(
+            "(json_array_length({raw}) > {})",
+            conn.page.as_ref().map(|p| p.size).unwrap_or(u64::MAX)
+        );
+        let pairs: Vec<String> = conn
+            .fields
+            .iter()
+            .map(|f| match f {
+                ConnectionField::Typename { alias, value } => {
+                    format!("{}, {}::text", quote_lit(alias), quote_lit(value))
+                }
+                ConnectionField::PageInfo { alias, fields } => {
+                    let inner: Vec<String> = fields
+                        .iter()
+                        .map(|(fa, name)| {
+                            let value = match name.as_str() {
+                                "startCursor" => format!("({a}->0->>'cursor')"),
+                                "endCursor" => format!(
+                                    "({a}->(json_array_length({a})-1)->>'cursor')"
+                                ),
+                                "hasNextPage" => match &conn.page {
+                                    Some(p) if !p.backward => has_more.clone(),
+                                    Some(p) if p.has_other_side => "true".to_string(),
+                                    _ => "false".to_string(),
+                                },
+                                "hasPreviousPage" => match &conn.page {
+                                    Some(p) if p.backward => has_more.clone(),
+                                    Some(p) if p.has_other_side => "true".to_string(),
+                                    _ => "false".to_string(),
+                                },
+                                _ => "null".to_string(),
+                            };
+                            format!("{}, {}", quote_lit(fa), value)
+                        })
+                        .collect();
+                    format!(
+                        "{}, json_build_object({})",
+                        quote_lit(alias),
+                        inner.join(", ")
+                    )
+                }
+                ConnectionField::Edges { alias, fields } => {
+                    // Re-project the prebuilt edges array onto the selection.
+                    let inner: Vec<String> = fields
+                        .iter()
+                        .map(|ef| match ef {
+                            EdgeField::Cursor { alias } => {
+                                format!("{}, e.value->'cursor'", quote_lit(alias))
+                            }
+                            EdgeField::Node { alias } => {
+                                format!("{}, e.value->'node'", quote_lit(alias))
+                            }
+                            EdgeField::Typename { alias, value } => {
+                                format!("{}, {}::text", quote_lit(alias), quote_lit(value))
+                            }
+                        })
+                        .collect();
+                    format!(
+                        "{}, coalesce((SELECT json_agg(json_build_object({})) FROM json_array_elements({a}) AS e), '[]'::json)",
+                        quote_lit(alias),
+                        inner.join(", ")
+                    )
+                }
+            })
+            .collect();
+
+        format!(
+            "(SELECT json_build_object({pairs}) FROM (SELECT coalesce(json_agg(json_build_object('cursor', {ed}.c, 'node', {ed}.n)), '[]'::json) AS a FROM (SELECT {cursor} AS c, {row_json} AS n {tail}) AS {ed}) AS {arr_q})",
+            pairs = pairs.join(", "),
+            ed = quote_ident(&format!("{arr}_e")),
+            arr_q = quote_ident(&arr),
+        )
+    }
+
+    /// A parenthesized scalar subquery producing this select's JSON value.
+    fn select_expr(&mut self, q: &SelectQuery, outer: Option<OuterJoin>) -> String {
+        if q.fields
+            .iter()
+            .any(|f| matches!(f.value, FieldValue::Aggregate { .. } | FieldValue::Nodes { .. }))
+        {
+            return self.aggregate_expr(q, outer);
+        }
+
+        let alias = self.alias();
+        let row_json = self.row_json(&q.fields, &alias);
+        let tail = self.from_where_order(q, &alias, outer);
+        let distinct = distinct_clause(q, &alias);
+
+        if q.single {
+            format!("(SELECT {distinct}{row_json} {tail} LIMIT 1)")
+        } else {
+            let elem = self.alias();
+            format!(
+                "(SELECT coalesce(json_agg({e}.j), '[]'::json) FROM (SELECT {distinct}{row_json} AS j {tail}) AS {e})",
+                e = quote_ident(&elem),
+            )
+        }
+    }
+
+    /// `<t>_aggregate` (root or relationship): aggregate + nodes over one
+    /// filtered row set.
+    fn aggregate_expr(&mut self, q: &SelectQuery, outer: Option<OuterJoin>) -> String {
+        let inner_alias = self.alias();
+        let tail = self.from_where_order(q, &inner_alias, outer);
+        let distinct = distinct_clause(q, &inner_alias);
+        let outer_alias = self.alias();
+        let oa = quote_ident(&outer_alias);
+
+        let pairs: Vec<String> = q
+            .fields
+            .iter()
+            .map(|f| {
+                let value = match &f.value {
+                    FieldValue::Aggregate { fields } => self.aggregate_json(fields, &outer_alias),
+                    FieldValue::Nodes { fields } => {
+                        if let Some(nodes_limit) = q.nodes_limit {
+                            // The permission limit caps visible rows but
+                            // not aggregates: nodes get their own select.
+                            let limit = Some(q.limit.map_or(nodes_limit, |l| l.min(nodes_limit)));
+                            let nodes_query = SelectQuery {
+                                from: q.from.clone(),
+                                fields: fields.clone(),
+                                predicate: q.predicate.clone(),
+                                order_by: q.order_by.clone(),
+                                limit,
+                                nodes_limit: None,
+                                offset: q.offset,
+                                distinct_on: q.distinct_on.clone(),
+                                single: false,
+                            };
+                            self.select_expr(&nodes_query, outer)
+                        } else {
+                            let row = self.row_json(fields, &outer_alias);
+                            format!("coalesce(json_agg({row}), '[]'::json)")
+                        }
+                    }
+                    FieldValue::Typename { value } => format!("to_json({}::text)", quote_lit(value)),
+                    other => panic!("non-aggregate field in aggregate select: {other:?}"),
+                };
+                format!("{}, {}", quote_lit(&f.alias), value)
+            })
+            .collect();
+
+        format!(
+            "(SELECT json_build_object({pairs}) FROM (SELECT {distinct}* {tail}) AS {oa})",
+            pairs = pairs.join(", "),
+        )
+    }
+
+    fn aggregate_json(&mut self, fields: &[AggregateField], table_alias: &str) -> String {
+        let pairs: Vec<String> = fields
+            .iter()
+            .map(|f| {
+                let value = match &f.op {
+                    AggregateOp::Count { distinct, columns } => {
+                        if columns.is_empty() {
+                            "COUNT(*)".to_string()
+                        } else {
+                            let cols: Vec<String> = columns
+                                .iter()
+                                .map(|c| qualified(table_alias, c))
+                                .collect();
+                            let d = if *distinct { "DISTINCT " } else { "" };
+                            // Multiple columns need a row constructor.
+                            let expr = if cols.len() == 1 {
+                                cols.join(", ")
+                            } else {
+                                format!("({})", cols.join(", "))
+                            };
+                            format!("COUNT({d}{expr})")
+                        }
+                    }
+                    AggregateOp::ColumnOp { op, columns } => {
+                        let inner: Vec<String> = columns
+                            .iter()
+                            .map(|c| {
+                                let col = qualified(table_alias, &c.column);
+                                let expr = match &c.guard {
+                                    Some(guard) => {
+                                        let cond =
+                                            self.bool_exp(guard, table_alias, table_alias);
+                                        format!("CASE WHEN {cond} THEN {col} ELSE NULL END")
+                                    }
+                                    None => col,
+                                };
+                                format!("{}, {op}({expr})", quote_lit(&c.alias))
+                            })
+                            .collect();
+                        format!("json_build_object({})", inner.join(", "))
+                    }
+                };
+                format!("{}, {}", quote_lit(&f.alias), value)
+            })
+            .collect();
+        format!("json_build_object({})", pairs.join(", "))
+    }
+
+    /// `FROM .. WHERE .. ORDER BY .. LIMIT .. OFFSET ..` for one select.
+    fn from_where_order(
+        &mut self,
+        q: &SelectQuery,
+        alias: &str,
+        outer: Option<OuterJoin>,
+    ) -> String {
+        let from_item = match &q.from {
+            FromSource::Table(t) => {
+                format!("{}.{}", quote_ident(&t.schema), quote_ident(&t.name))
+            }
+            FromSource::Function { schema, name, args } => {
+                let rendered: Vec<String> = args
+                    .iter()
+                    .map(|a| {
+                        let value = scalar_sql(&a.value, &a.pg_type);
+                        match &a.name {
+                            Some(arg_name) => {
+                                format!("{} => {value}", quote_ident(arg_name))
+                            }
+                            None => value,
+                        }
+                    })
+                    .collect();
+                format!(
+                    "{}.{}({})",
+                    quote_ident(schema),
+                    quote_ident(name),
+                    rendered.join(", ")
+                )
+            }
+            FromSource::RowFunction { schema, name, args } => {
+                let outer_alias = outer
+                    .map(|(_, a)| a)
+                    .expect("row function requires an enclosing row");
+                let rendered: Vec<String> = args
+                    .iter()
+                    .map(|a| row_function_arg(a, outer_alias))
+                    .collect();
+                format!(
+                    "{}.{}({})",
+                    quote_ident(schema),
+                    quote_ident(name),
+                    rendered.join(", ")
+                )
+            }
+        };
+        let mut sql = format!("FROM {from_item} AS {}", quote_ident(alias));
+
+        let mut conds: Vec<String> = vec![];
+        if let Some((join, outer_alias)) = outer {
+            for (local, remote) in join {
+                conds.push(format!(
+                    "{} = {}",
+                    qualified(alias, remote),
+                    qualified(outer_alias, local)
+                ));
+            }
+        }
+        if let Some(pred) = &q.predicate {
+            conds.push(self.bool_exp(pred, alias, alias));
+        }
+        if !conds.is_empty() {
+            sql.push_str(&format!(" WHERE {}", conds.join(" AND ")));
+        }
+
+        if !q.order_by.is_empty() {
+            let items: Vec<String> = q
+                .order_by
+                .iter()
+                .map(|ob| {
+                    let target = match &ob.target {
+                        OrderByTarget::Column(c) => qualified(alias, c),
+                        OrderByTarget::Relationship { table, join, column, predicate } => {
+                            let ra = self.alias();
+                            let mut conds: Vec<String> = join
+                                .iter()
+                                .map(|(local, remote)| {
+                                    format!(
+                                        "{} = {}",
+                                        qualified(&ra, remote),
+                                        qualified(alias, local)
+                                    )
+                                })
+                                .collect();
+                            if let Some(pred) = predicate {
+                                conds.push(self.bool_exp(pred, &ra, &ra));
+                            }
+                            format!(
+                                "(SELECT {} FROM {}.{} AS {} WHERE {} LIMIT 1)",
+                                qualified(&ra, column),
+                                quote_ident(&table.schema),
+                                quote_ident(&table.name),
+                                quote_ident(&ra),
+                                conds.join(" AND ")
+                            )
+                        }
+                        OrderByTarget::RelationshipAggregate {
+                            table,
+                            join,
+                            function,
+                            column,
+                            predicate,
+                        } => {
+                            let ra = self.alias();
+                            let mut conds: Vec<String> = join
+                                .iter()
+                                .map(|(local, remote)| {
+                                    format!(
+                                        "{} = {}",
+                                        qualified(&ra, remote),
+                                        qualified(alias, local)
+                                    )
+                                })
+                                .collect();
+                            if let Some(pred) = predicate {
+                                conds.push(self.bool_exp(pred, &ra, &ra));
+                            }
+                            let agg = match column {
+                                Some(c) => format!("{function}({})", qualified(&ra, c)),
+                                None => "count(*)".to_string(),
+                            };
+                            format!(
+                                "(SELECT {agg} FROM {}.{} AS {} WHERE {})",
+                                quote_ident(&table.schema),
+                                quote_ident(&table.name),
+                                quote_ident(&ra),
+                                conds.join(" AND ")
+                            )
+                        }
+                    };
+                    let dir = match ob.direction {
+                        OrderDirection::Asc => "ASC",
+                        OrderDirection::Desc => "DESC",
+                    };
+                    let nulls = match ob.nulls {
+                        NullsOrder::First => "NULLS FIRST",
+                        NullsOrder::Last => "NULLS LAST",
+                    };
+                    format!("{target} {dir} {nulls}")
+                })
+                .collect();
+            sql.push_str(&format!(" ORDER BY {}", items.join(", ")));
+        }
+
+        if let Some(limit) = q.limit {
+            sql.push_str(&format!(" LIMIT {limit}"));
+        }
+        if let Some(offset) = q.offset {
+            sql.push_str(&format!(" OFFSET {offset}"));
+        }
+        sql
+    }
+
+    fn row_json(&mut self, fields: &[OutputField], table_alias: &str) -> String {
+        let pairs: Vec<String> = fields
+            .iter()
+            .map(|f| {
+                let value = match &f.value {
+                    FieldValue::ColumnGuarded { column, pg_type, guard } => {
+                        let col = self.column_output(table_alias, column, pg_type);
+                        let cond = self.bool_exp(guard, table_alias, table_alias);
+                        format!("CASE WHEN {cond} THEN {col} ELSE NULL END")
+                    }
+                    FieldValue::Column { column, pg_type } => {
+                        let col = qualified(table_alias, column);
+                        match pg_type.as_str() {
+                            // Hasura renders geometry as GeoJSON with the
+                            // long CRS form (options bit 4).
+                            "geometry" | "geography" => {
+                                format!("ST_AsGeoJSON({col}, 15, 4)::json")
+                            }
+                            "int8" | "numeric" if self.stringify_numerics => {
+                                format!("({col})::text")
+                            }
+                            _ => col,
+                        }
+                    }
+                    FieldValue::Typename { value } => format!("{}::text", quote_lit(value)),
+                    FieldValue::Object { query, join } => {
+                        self.select_expr(query, Some((join, table_alias)))
+                    }
+                    FieldValue::Array { query, join, .. } => {
+                        self.select_expr(query, Some((join, table_alias)))
+                    }
+                    FieldValue::RelayGlobalId { schema, table, pk } => {
+                        let schema = schema.clone();
+                        let table = table.clone();
+                        let pk = pk.clone();
+                        self.global_id_expr(table_alias, &schema, &table, &pk)
+                    }
+                    FieldValue::NestedConnection { conn } => {
+                        self.connection_expr(conn, Some((&conn.join, table_alias)))
+                    }
+                    FieldValue::RemoteJoin { .. } => "NULL::json".to_string(),
+                    FieldValue::ComputedScalar { schema, name, args, guard } => {
+                        let rendered: Vec<String> = args
+                            .iter()
+                            .map(|a| row_function_arg(a, table_alias))
+                            .collect();
+                        let call = format!(
+                            "{}.{}({})",
+                            quote_ident(schema),
+                            quote_ident(name),
+                            rendered.join(", ")
+                        );
+                        match guard {
+                            Some(guard) => {
+                                let cond =
+                                    self.bool_exp(guard, table_alias, table_alias);
+                                format!("CASE WHEN {cond} THEN {call} ELSE NULL END")
+                            }
+                            None => call,
+                        }
+                    }
+                    FieldValue::Aggregate { .. } | FieldValue::Nodes { .. } => {
+                        panic!("aggregate fields must go through aggregate_expr")
+                    }
+                };
+                format!("{}, {}", quote_lit(&f.alias), value)
+            })
+            .collect();
+        format!("json_build_object({})", pairs.join(", "))
+    }
+
+    /// Column output expression with type-specific casts.
+    fn column_output(&mut self, table_alias: &str, column: &str, pg_type: &str) -> String {
+        let col = qualified(table_alias, column);
+        match pg_type {
+            "geometry" | "geography" => format!("ST_AsGeoJSON({col}, 15, 4)::json"),
+            "int8" | "numeric" if self.stringify_numerics => format!("({col})::text"),
+            _ => col,
+        }
+    }
+
+    fn bool_exp(&mut self, exp: &BoolExp, alias: &str, root: &str) -> String {
+        match exp {
+            BoolExp::And(exps) => {
+                if exps.is_empty() {
+                    "TRUE".into()
+                } else {
+                    let parts: Vec<String> =
+                        exps.iter().map(|e| self.bool_exp(e, alias, root)).collect();
+                    format!("({})", parts.join(" AND "))
+                }
+            }
+            BoolExp::Or(exps) => {
+                if exps.is_empty() {
+                    "FALSE".into()
+                } else {
+                    let parts: Vec<String> =
+                        exps.iter().map(|e| self.bool_exp(e, alias, root)).collect();
+                    format!("({})", parts.join(" OR "))
+                }
+            }
+            BoolExp::Not(inner) => format!("(NOT {})", self.bool_exp(inner, alias, root)),
+            BoolExp::Compare { column, pg_type, op } => {
+                let col = qualified(alias, column);
+                self.compare(&col, pg_type, op, alias, root)
+            }
+            BoolExp::Relationship { table, join, predicate } => {
+                let ra = self.alias();
+                let mut conds: Vec<String> = join
+                    .iter()
+                    .map(|(local, remote)| {
+                        format!("{} = {}", qualified(&ra, remote), qualified(alias, local))
+                    })
+                    .collect();
+                conds.push(self.bool_exp(predicate, &ra, root));
+                format!(
+                    "EXISTS (SELECT 1 FROM {}.{} AS {} WHERE {})",
+                    quote_ident(&table.schema),
+                    quote_ident(&table.name),
+                    quote_ident(&ra),
+                    conds.join(" AND ")
+                )
+            }
+            BoolExp::ComputedCompare { schema, name, args, pg_type, op } => {
+                let rendered: Vec<String> =
+                    args.iter().map(|a| row_function_arg(a, alias)).collect();
+                let expr = format!(
+                    "{}.{}({})",
+                    quote_ident(schema),
+                    quote_ident(name),
+                    rendered.join(", ")
+                );
+                self.compare(&expr, pg_type, op, alias, root)
+            }
+            BoolExp::Exists { table, predicate } => {
+                let ra = self.alias();
+                let pred = self.bool_exp(predicate, &ra, &ra);
+                format!(
+                    "EXISTS (SELECT 1 FROM {}.{} AS {} WHERE {})",
+                    quote_ident(&table.schema),
+                    quote_ident(&table.name),
+                    quote_ident(&ra),
+                    pred
+                )
+            }
+            BoolExp::RowFunctionExists { schema, name, args, predicate } => {
+                let ra = self.alias();
+                let rendered: Vec<String> =
+                    args.iter().map(|a| row_function_arg(a, alias)).collect();
+                let pred = self.bool_exp(predicate, &ra, root);
+                format!(
+                    "EXISTS (SELECT 1 FROM {}.{}({}) AS {} WHERE {})",
+                    quote_ident(schema),
+                    quote_ident(name),
+                    rendered.join(", "),
+                    quote_ident(&ra),
+                    pred
+                )
+            }
+        }
+    }
+
+    fn compare(&mut self, col: &str, pg_type: &str, op: &CompareOp, alias: &str, root: &str) -> String {
+        let lit = |s: &Scalar| scalar_sql(s, pg_type);
+        match op {
+            CompareOp::Eq(v) => format!("{col} = {}", lit(v)),
+            CompareOp::Neq(v) => format!("{col} <> {}", lit(v)),
+            CompareOp::Gt(v) => format!("{col} > {}", lit(v)),
+            CompareOp::Lt(v) => format!("{col} < {}", lit(v)),
+            CompareOp::Gte(v) => format!("{col} >= {}", lit(v)),
+            CompareOp::Lte(v) => format!("{col} <= {}", lit(v)),
+            CompareOp::In(vs) => {
+                if vs.is_empty() {
+                    "FALSE".into()
+                } else {
+                    let items: Vec<String> = vs.iter().map(lit).collect();
+                    format!("{col} IN ({})", items.join(", "))
+                }
+            }
+            CompareOp::Nin(vs) => {
+                if vs.is_empty() {
+                    "TRUE".into()
+                } else {
+                    let items: Vec<String> = vs.iter().map(lit).collect();
+                    format!("{col} NOT IN ({})", items.join(", "))
+                }
+            }
+            CompareOp::Like(v) => format!("{col} LIKE {}", lit(v)),
+            CompareOp::Nlike(v) => format!("{col} NOT LIKE {}", lit(v)),
+            CompareOp::Ilike(v) => format!("{col} ILIKE {}", lit(v)),
+            CompareOp::Nilike(v) => format!("{col} NOT ILIKE {}", lit(v)),
+            CompareOp::Similar(v) => format!("{col} SIMILAR TO {}", lit(v)),
+            CompareOp::Nsimilar(v) => format!("{col} NOT SIMILAR TO {}", lit(v)),
+            CompareOp::Regex(v) => format!("{col} ~ {}", lit(v)),
+            CompareOp::Iregex(v) => format!("{col} ~* {}", lit(v)),
+            CompareOp::Nregex(v) => format!("{col} !~ {}", lit(v)),
+            CompareOp::Niregex(v) => format!("{col} !~* {}", lit(v)),
+            CompareOp::IsNull(true) => format!("{col} IS NULL"),
+            CompareOp::IsNull(false) => format!("{col} IS NOT NULL"),
+            CompareOp::CompareColumn { sql_op, column, root: use_root } => {
+                let base = if *use_root { root } else { alias };
+                format!("{col} {sql_op} {}", qualified(base, column))
+            }
+            CompareOp::CompareColumnRel { sql_op, table, join, column } => {
+                let ra = self.alias();
+                let conds: Vec<String> = join
+                    .iter()
+                    .map(|(local, remote)| {
+                        format!("{} = {}", qualified(&ra, remote), qualified(alias, local))
+                    })
+                    .collect();
+                format!(
+                    "{col} {sql_op} (SELECT {} FROM {}.{} AS {} WHERE {} LIMIT 1)",
+                    qualified(&ra, column),
+                    quote_ident(&table.schema),
+                    quote_ident(&table.name),
+                    quote_ident(&ra),
+                    conds.join(" AND ")
+                )
+            }
+            CompareOp::HasKey(v) => format!("{col} ? {}", scalar_sql(v, "text")),
+            CompareOp::HasKeysAny(keys) => format!("{col} ?| {}", text_array(keys)),
+            CompareOp::HasKeysAll(keys) => format!("{col} ?& {}", text_array(keys)),
+            CompareOp::Contains(v) => format!("{col} @> {}", scalar_sql(v, "jsonb")),
+            CompareOp::ContainedIn(v) => format!("{col} <@ {}", scalar_sql(v, "jsonb")),
+            CompareOp::StOp { function, value } => {
+                format!("{function}({col}, {})", geometry_sql(value, pg_type))
+            }
+            CompareOp::StDWithin { distance, from } => {
+                format!(
+                    "ST_DWithin({col}, {}, {})",
+                    geometry_sql(from, pg_type),
+                    scalar_sql(distance, "float8")
+                )
+            }
+        }
+    }
+}
+
+fn text_array(items: &[String]) -> String {
+    let quoted: Vec<String> = items.iter().map(|s| quote_lit(s)).collect();
+    format!("array[{}]::text[]", quoted.join(", "))
+}
+
+/// A geometry/geography literal: GeoJSON objects (or strings holding
+/// GeoJSON, e.g. from session variables) go through ST_GeomFromGeoJSON;
+/// other strings are assumed to be WKT/EWKT.
+fn geometry_sql(value: &Scalar, pg_type: &str) -> String {
+    let cast = quote_ident(pg_type);
+    match value.as_json() {
+        serde_json::Value::Object(_) => format!(
+            "(ST_GeomFromGeoJSON({}))::{cast}",
+            quote_lit(&value.as_json().to_string())
+        ),
+        serde_json::Value::String(s) if s.trim_start().starts_with('{') => {
+            format!("(ST_GeomFromGeoJSON({}))::{cast}", quote_lit(s))
+        }
+        serde_json::Value::String(s) => format!("({})::{cast}", quote_lit(s)),
+        other => format!("({})::{cast}", quote_lit(&other.to_string())),
+    }
+}
+
+/// Compile one mutation root field into one SQL statement. The statement
+/// computes the GraphQL value of the field as a single `json` column named
+/// `root`. Permission check expressions are enforced in-statement via
+/// `dist_api.check_violation(...)`, which raises SQLSTATE 23514.
+pub fn mutation_to_sql(root: &MutationRoot) -> String {
+    mutation_to_sql_opts(root, false)
+}
+
+pub fn mutation_to_sql_opts(root: &MutationRoot, stringify_numerics: bool) -> String {
+    let mut ctx = Ctx { next_alias: 0, stringify_numerics };
+    match root {
+        MutationRoot::Typename { value, .. } => {
+            format!("SELECT {}::text AS root", quote_lit(value))
+        }
+        MutationRoot::FunctionCall { query, .. } => {
+            format!("SELECT {} AS root", ctx.select_expr(query, None))
+        }
+        MutationRoot::Insert { insert, .. } => {
+            let cols: Vec<String> = insert
+                .columns
+                .iter()
+                .map(|(name, _)| quote_ident(name))
+                .collect();
+            let rows: Vec<String> = insert
+                .rows
+                .iter()
+                .map(|row| {
+                    let values: Vec<String> = row
+                        .iter()
+                        .zip(&insert.columns)
+                        .map(|(v, (_, pg_type))| match v {
+                            None => "DEFAULT".to_string(),
+                            Some(s) => scalar_sql(s, pg_type),
+                        })
+                        .collect();
+                    format!("({})", values.join(", "))
+                })
+                .collect();
+            let mut stmt = format!(
+                "INSERT INTO {}.{} ({}) VALUES {}",
+                quote_ident(&insert.table.schema),
+                quote_ident(&insert.table.name),
+                cols.join(", "),
+                rows.join(", ")
+            );
+            if let Some(oc) = &insert.on_conflict {
+                if oc.update_columns.is_empty() && oc.set_ops.is_empty() {
+                    stmt.push_str(&format!(
+                        " ON CONFLICT ON CONSTRAINT {} DO NOTHING",
+                        quote_ident(&oc.constraint)
+                    ));
+                } else {
+                    let mut sets: Vec<String> = oc
+                        .update_columns
+                        .iter()
+                        .map(|c| format!("{} = EXCLUDED.{}", quote_ident(c), quote_ident(c)))
+                        .collect();
+                    for op in &oc.set_ops {
+                        match op {
+                            SetOp::Set { column, pg_type, value } => sets.push(format!(
+                                "{} = {}",
+                                quote_ident(column),
+                                scalar_sql(value, pg_type)
+                            )),
+                            SetOp::Inc { column, pg_type, value } => sets.push(format!(
+                                "{} = {}.{} + {}",
+                                quote_ident(column),
+                                quote_ident(&insert.table.name),
+                                quote_ident(column),
+                                scalar_sql(value, pg_type)
+                            )),
+                        }
+                    }
+                    stmt.push_str(&format!(
+                        " ON CONFLICT ON CONSTRAINT {} DO UPDATE SET {}",
+                        quote_ident(&oc.constraint),
+                        sets.join(", ")
+                    ));
+                    if let Some(pred) = &oc.predicate {
+                        // In DO UPDATE, the existing row is addressable by
+                        // the table name.
+                        let cond = ctx.bool_exp(pred, &insert.table.name, &insert.table.name);
+                        stmt.push_str(&format!(" WHERE {cond}"));
+                    }
+                }
+            }
+            stmt.push_str(" RETURNING *");
+            ctx.mutation_select(
+                "ins",
+                &stmt,
+                insert.check.as_ref(),
+                &insert.check_path,
+                &insert.output,
+            )
+        }
+        MutationRoot::Update { update, .. } => {
+            let sets: Vec<String> = update
+                .sets
+                .iter()
+                .map(|s| match s {
+                    SetOp::Set { column, pg_type, value } => {
+                        format!("{} = {}", quote_ident(column), scalar_sql(value, pg_type))
+                    }
+                    SetOp::Inc { column, pg_type, value } => format!(
+                        "{} = {} + {}",
+                        quote_ident(column),
+                        quote_ident(column),
+                        scalar_sql(value, pg_type)
+                    ),
+                })
+                .collect();
+            let alias = "_upd_target".to_string();
+            let mut stmt = format!(
+                "UPDATE {}.{} AS {} SET {}",
+                quote_ident(&update.table.schema),
+                quote_ident(&update.table.name),
+                quote_ident(&alias),
+                sets.join(", ")
+            );
+            if let Some(pred) = &update.predicate {
+                stmt.push_str(&format!(" WHERE {}", ctx.bool_exp(pred, &alias, &alias)));
+            }
+            stmt.push_str(" RETURNING *");
+            ctx.mutation_select(
+                "upd",
+                &stmt,
+                update.check.as_ref(),
+                &update.check_path,
+                &update.output,
+            )
+        }
+        MutationRoot::Delete { delete, .. } => {
+            let alias = "_del_target".to_string();
+            let mut stmt = format!(
+                "DELETE FROM {}.{} AS {}",
+                quote_ident(&delete.table.schema),
+                quote_ident(&delete.table.name),
+                quote_ident(&alias)
+            );
+            if let Some(pred) = &delete.predicate {
+                stmt.push_str(&format!(" WHERE {}", ctx.bool_exp(pred, &alias, &alias)));
+            }
+            stmt.push_str(" RETURNING *");
+            ctx.mutation_select("del", &stmt, None, "$", &delete.output)
+        }
+    }
+}
+
+impl Ctx {
+    /// Wrap a DML statement in a CTE and select the GraphQL response from
+    /// its RETURNING set, enforcing the permission check expression.
+    fn mutation_select(
+        &mut self,
+        cte: &str,
+        dml: &str,
+        check: Option<&BoolExp>,
+        check_path: &str,
+        output: &MutationOutput,
+    ) -> String {
+        let cte_ident = quote_ident(cte);
+        let result = match output {
+            MutationOutput::Response(fields) => {
+                let pairs: Vec<String> = fields
+                    .iter()
+                    .map(|f| match f {
+                        MutationResponseField::AffectedRows { alias } => format!(
+                            "{}, (SELECT count(*) FROM {cte_ident})",
+                            quote_lit(alias)
+                        ),
+                        MutationResponseField::Typename { alias, value } => {
+                            format!("{}, {}::text", quote_lit(alias), quote_lit(value))
+                        }
+                        MutationResponseField::Returning { alias, fields } => {
+                            let row = self.row_json(fields, cte);
+                            format!(
+                                "{}, (SELECT coalesce(json_agg({row}), '[]'::json) FROM {cte_ident})",
+                                quote_lit(alias)
+                            )
+                        }
+                    })
+                    .collect();
+                format!("json_build_object({})", pairs.join(", "))
+            }
+            MutationOutput::SingleRow(fields) => {
+                let row = self.row_json(fields, cte);
+                format!("(SELECT {row} FROM {cte_ident} LIMIT 1)")
+            }
+        };
+
+        let guarded = match check {
+            Some(check) => {
+                let violated = format!(
+                    "(SELECT count(*) FROM {cte_ident} WHERE NOT ({}))",
+                    self.bool_exp(check, cte, cte)
+                );
+                // The message carries the GraphQL error path as JSON; the
+                // executor unpacks it into the Hasura error shape.
+                let payload = serde_json::json!({
+                    "path": check_path,
+                    "message": "check constraint of an insert/update permission has failed",
+                })
+                .to_string();
+                format!(
+                    "CASE WHEN {violated} > 0 THEN dist_api.check_violation({}) ELSE {result} END",
+                    quote_lit(&payload)
+                )
+            }
+            None => result,
+        };
+        format!("WITH {cte_ident} AS ({dml}) SELECT {guarded} AS root")
+    }
+}
+
+fn row_function_arg(arg: &RowFunctionArg, outer_alias: &str) -> String {
+    match arg {
+        // The enclosing FROM alias is a composite value of the table's
+        // row type, which is exactly what the function expects.
+        RowFunctionArg::Row => quote_ident(outer_alias),
+        RowFunctionArg::SessionJson(json) => format!("({})::json", quote_lit(json)),
+        RowFunctionArg::Value { value, pg_type } => scalar_sql(value, pg_type),
+    }
+}
+
+/// `DISTINCT ON (cols) ` prefix for the row-producing SELECT, or empty.
+fn distinct_clause(q: &SelectQuery, alias: &str) -> String {
+    if q.distinct_on.is_empty() {
+        String::new()
+    } else {
+        let cols: Vec<String> = q.distinct_on.iter().map(|c| qualified(alias, c)).collect();
+        format!("DISTINCT ON ({}) ", cols.join(", "))
+    }
+}
+
+fn qualified(alias: &str, column: &str) -> String {
+    format!("{}.{}", quote_ident(alias), quote_ident(column))
+}
+
+pub fn quote_ident(ident: &str) -> String {
+    format!("\"{}\"", ident.replace('"', "\"\""))
+}
+
+pub fn quote_lit(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+/// Render a JSON scalar as a SQL literal cast to the column's type.
+fn scalar_sql(scalar: &Scalar, pg_type: &str) -> String {
+    if matches!(pg_type, "geometry" | "geography") && scalar.as_json().is_object() {
+        return geometry_sql(scalar, pg_type);
+    }
+    let ty = quote_ident(pg_type);
+    match scalar.as_json() {
+        serde_json::Value::Null => "NULL".into(),
+        serde_json::Value::Bool(b) => {
+            if *b { "TRUE".into() } else { "FALSE".into() }
+        }
+        serde_json::Value::Number(n) => format!("({n})::{ty}"),
+        serde_json::Value::String(s) => format!("({})::{ty}", quote_lit(s)),
+        // arrays/objects target json/jsonb columns
+        other => format!("({})::{ty}", quote_lit(&other.to_string())),
+    }
+}

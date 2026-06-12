@@ -1,0 +1,6 @@
+---
+source: crates/sqlgen/tests/pipeline.rs
+assertion_line: 168
+expression: "plan_sql(r#\"query {\n            article_aggregate(where: { published: { _eq: true } }) {\n                aggregate { count }\n                nodes { id }\n            }\n        }\"#)"
+---
+SELECT json_build_object('article_aggregate', (SELECT json_build_object('aggregate', json_build_object('count', COUNT(*)), 'nodes', (SELECT coalesce(json_agg("_t3".j), '[]'::json) FROM (SELECT json_build_object('id', "_t2"."id") AS j FROM "public"."article" AS "_t2" WHERE ("_t2"."published" = TRUE AND ("_t2"."published" = TRUE OR "_t2"."author_id" = ('1')::"int4")) LIMIT 100) AS "_t3")) FROM (SELECT * FROM "public"."article" AS "_t0" WHERE ("_t0"."published" = TRUE AND ("_t0"."published" = TRUE OR "_t0"."author_id" = ('1')::"int4"))) AS "_t1")) AS root

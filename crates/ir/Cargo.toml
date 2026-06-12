@@ -1,0 +1,10 @@
+[package]
+name = "dist-ir"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Intermediate representation: validated, permission-resolved query plan, independent of SQL"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
