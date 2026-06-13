@@ -63,19 +63,17 @@ patched copies with comments, do not "fix" the engine to 400. The legacy
 pytest harness only WARNED on error-body mismatches; the native harness is
 strict — pytest greenness is not evidence of exact conformance.
 
-## Admin Role (Hasura parity)
+## BLOCKING RULE: No Admin Role
 
-**This engine implements the Hasura admin role** (the earlier "no admin
-role" decision was reversed on 2026-06-13). `dist_schema::ADMIN_ROLE` =
-"admin": a trusted request with no explicit `X-Hasura-Role` is admin — full
-access to every tracked table, no row filter, no column/limit restriction,
-all mutations (no check/preset), allowlist skipped. Trusted = valid
-`X-Hasura-Admin-Secret`, or no admin secret configured (Hasura's
-"no secret = admin"); an explicit role header still selects that role
-(impersonation). Implemented in `plan.rs` (`TableCtx.is_admin`),
-`plan_mutation.rs`/`v1.rs` (synthetic full mutation perms), `gql.rs`
-(session + allowlist bypass), `ops.rs` (v1 admin session). Keep admin
-behavior faithful to Hasura; don't silently weaken it.
+**This engine has no admin role.** Only classic explicit roles work — every
+data access goes through an explicit per-role permission. There is no
+permission-bypass role and no admin-over-HTTP surface at all: the runtime
+admin/management API (`run_sql`, metadata mutation) was deleted, and the
+admin DATA role (the `ADMIN_ROLE` permission bypass) was removed too. A
+trusted request with no `X-Hasura-Role` is denied ("x-hasura-role header is
+required"); `X-Hasura-Admin-Secret` is API-level auth only. Any diff that
+re-introduces an admin role or permission bypass must be rejected.
+Configuration is deploy-time: `migrate` (DDL) + YAML metadata at boot.
 
 ## BLOCKING RULE: Knowledgebase First
 

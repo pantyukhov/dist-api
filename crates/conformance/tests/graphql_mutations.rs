@@ -46,9 +46,8 @@ fn graphql_insert_permission() {
         "resident_infant.yaml",
         "resident_infant_fail.yaml",
         "resident_5_modifies_resident_6_upsert.yaml",
-        // resident_on_conflict_where.yaml: no-role (admin) request — now
-        // covered (admin role implemented).
-        "resident_on_conflict_where.yaml",
+        // resident_on_conflict_where.yaml: no-role (admin) request — out of
+        // scope (this engine has no admin role).
         "blog_on_conflict_update_preset.yaml",
         "insert_article_arr_sess_var_editor_allowed_user_id.yaml",
         // Status-only known-diff (fixture patched 400 -> 200, see COVERAGE.md):

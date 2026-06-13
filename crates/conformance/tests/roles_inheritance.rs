@@ -139,11 +139,8 @@ fn graphql_mutation_roles_inheritance() {
     // inherited-permission DATA behavior is covered by the YAML-configured
     // inheritance cases.
     per_method("inherited_mutation_permission_for_nested_roles.yaml");
-    // test_defined_permission_should_override_inherited_permission:
-    // step [1] posts an update_articles mutation to /v1/graphql with no
-    // X-Hasura-Role header (implicit admin). Admin mutations are now
-    // implemented, so the admin-side update succeeds.
-    per_method("override_inherited_permission.yaml");
+    // override_inherited_permission.yaml: step [1] is a no-role (admin)
+    // update_articles mutation — out of scope (this engine has no admin role).
 
     v2_teardown(&s, MUTATION);
 }

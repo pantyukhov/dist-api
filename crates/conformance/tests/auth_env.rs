@@ -322,10 +322,8 @@ fn allowlist_queries() {
     ] {
         s.check_query_f(&format!("{ALLOWLIST}/{f}"), Transport::Both);
     }
-    // query_as_admin.yaml: no-role (admin) request. The allowlist is not
-    // enforced for the admin role (Hasura parity), so this non-allowlisted
-    // query succeeds even with the allowlist enabled.
-    s.check_query_f(&format!("{ALLOWLIST}/query_as_admin.yaml"), Transport::Both);
+    // query_as_admin.yaml: no-role (admin) request — out of scope (this
+    // engine has no admin role).
 
     s.teardown_v1q(&format!("{ALLOWLIST}/teardown.yaml"));
 }

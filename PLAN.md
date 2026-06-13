@@ -184,3 +184,15 @@ suite without the admin API: DDL/seed via direct SQL, metadata accumulated
 in-harness and loaded via `--metadata-dir` (lazy engine start). 228 tests
 green. Remaining: remote-schema support from YAML needs boot-time upstream
 introspection (the data-plane forwarding code in remote.rs remains).
+
+## Admin data-role removed too (2026-06-13)
+
+Following the admin-API deletion, the admin DATA role (the `ADMIN_ROLE`
+permission bypass on /v1/graphql) was also removed — the engine now supports
+only classic explicit roles. Reverted: `plan.rs` (ADMIN_ROLE const,
+TableCtx.is_admin, table_ctx admin branch, aggregate/computed-field admin
+gates), `plan_mutation.rs` + `v1.rs` (synthetic admin perms), `gql.rs`
+(no-role trusted -> denied again; allowlist no longer bypassed for admin).
+A trusted no-role request is denied. The admin conformance steps added for
+the role were re-excluded (remarks_col, query_as_admin, resident_on_conflict,
+admin introspection, override_inherited). 228 tests green.
