@@ -19,12 +19,16 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: petshop
-    ports:
-      - "15432:5432"
+    # Not exposed on the host: only the engine talks to it over the compose
+    # network. Add a `ports:` mapping if you want to inspect it with psql.
     volumes:
       - petshop-db:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d petshop"]
+      # Check over TCP (-h 127.0.0.1), not the unix socket: on first init the
+      # official image runs a socket-only temp server, so a socket pg_isready
+      # reports healthy before the real TCP listener is up — and the one-shot
+      # `migrate` does not retry. TCP stays refused until the server is ready.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d petshop"]
       interval: 3s
       timeout: 3s
       retries: 20
