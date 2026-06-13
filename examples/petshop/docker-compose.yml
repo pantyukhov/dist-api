@@ -70,8 +70,10 @@ services:
       HASURA_GRAPHQL_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/petshop
       DIST_API_METADATA_DIR: /metadata
       DIST_API_PORT: "8080"
-      # Trusted requests (with this secret) act as admin and may impersonate
-      # any role via the X-Hasura-Role header. Change it for anything real.
+      # The secret marks a request as trusted: it may then assert any role
+      # via the X-Hasura-Role header (a demo stand-in for real edge auth /
+      # JWTs). There is no admin role — a trusted request must still name a
+      # role. Change the secret for anything real.
       HASURA_GRAPHQL_ADMIN_SECRET: petshop-secret
       # Requests with no/role-less auth fall back to the public catalog role.
       HASURA_GRAPHQL_UNAUTHORIZED_ROLE: anonymous

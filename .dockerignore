@@ -1,0 +1,7 @@
+# Keep the Docker build context small and reproducible.
+target/
+.git/
+tests/hasura/tests-py/
+**/*.log
+.claude/
+knowledgebase/

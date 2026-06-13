@@ -2,14 +2,15 @@
 
 A classic pet-store running on **dist-api** — a small catalogue of pets in
 categories, customers, and their orders — wired up with the permission set a
-normal store needs: a public catalogue, authenticated shoppers, store staff,
-and the built-in admin.
+normal store needs: a public catalogue, authenticated shoppers, and store
+staff. Every access goes through an explicit role permission — there is no
+admin role.
 
 ```
 docker compose up
 ```
 
-All four services use the same prebuilt public engine image
+All services use the same prebuilt public engine image
 (`ghcr.io/pantyukhov/dist-api`, published by the release workflow) and follow
 the project's deploy model:
 
@@ -51,13 +52,14 @@ Relationships: `pet.category`, `category.pets`, `orders.customer`,
 | `anonymous` | unauthenticated    | Browse categories and **available** pets only. No customer/order data.|
 | `customer`  | a logged-in shopper| See own profile/orders, browse available pets, place orders for self.  |
 | `staff`     | store employee     | Full inventory CRUD, read every customer/order, update order status.   |
-| `admin`     | built-in           | Everything, no row/column limits.                                      |
 
-`anonymous` is the `HASURA_GRAPHQL_UNAUTHORIZED_ROLE`: any request with no role
-falls back to it. The admin secret is `petshop-secret` (see
-`docker-compose.yml`) — a trusted request acts as admin and may impersonate any
-role with the `X-Hasura-Role` header. In production, set a real secret and
-issue JWTs instead of passing roles by hand.
+There is **no admin role**: every request runs as one of the roles above,
+each scoped by its explicit permissions. `anonymous` is the
+`HASURA_GRAPHQL_UNAUTHORIZED_ROLE` — any request with no/role-less auth falls
+back to it. The secret `petshop-secret` (see `docker-compose.yml`) marks a
+request as *trusted* so it may assert a role via the `X-Hasura-Role` header (a
+demo stand-in for edge auth); a trusted request must still name a role. In
+production, issue JWTs instead of passing roles by hand.
 
 ## Try it
 
@@ -113,16 +115,11 @@ curl -s localhost:8080/v1/graphql \
   -d '{ "query": "mutation { update_orders(where: {id: {_eq: 1}}, _set: {status: \"shipped\"}) { affected_rows } }" }'
 ```
 
-### Admin
-
-Send the admin secret with **no** role header for unrestricted access:
-
-```bash
-curl -s localhost:8080/v1/graphql \
-  -H 'content-type: application/json' \
-  -H 'x-hasura-admin-secret: petshop-secret' \
-  -d '{ "query": "{ customer { id name orders_aggregate { aggregate { count } } } }" }'
-```
+> A request with **no** role — even with the secret — runs as `anonymous`
+> (the unauthorized-role fallback); there is no admin role or bypass. To read
+> across all customers, ask as `staff`. (If `HASURA_GRAPHQL_UNAUTHORIZED_ROLE`
+> were unset, a trusted role-less request would instead be rejected with
+> `x-hasura-role header is required`.)
 
 ## Reset
 
