@@ -14,8 +14,9 @@ All four services use the same prebuilt public engine image
 the project's deploy model:
 
 1. **`migrate`** — `dist-api migrate` applies the versioned DDL in
-   [`migrations/`](migrations) (`V1__schema.sql`, `V2__seed.sql`) via refinery,
-   tracked in `refinery_schema_history`. This is the only thing that runs DDL.
+   [`migrations/`](migrations) (one `V{n}__create_<table>.sql` per table) via
+   refinery, tracked in `refinery_schema_history`. This is the only thing that
+   runs DDL.
 2. **`validate`** — `dist-api validate` loads the [`metadata/`](metadata),
    introspects the migrated database, and exits non-zero if anything tracked
    is missing, so a bad deploy fails before the server boots.
