@@ -41,6 +41,7 @@ fn sync_suite(name: &str) -> Running {
         "intentional_error",
         "get_user_by_email",
         "get_users_by_email",
+        "get_user_by_email_nested",
     ] {
         op(&s, json!({
             "type": "create_action_permission",
@@ -161,4 +162,10 @@ fn engine_callback_actions() {
     seed_user(&s, "Clarke 1", "clarke@gmail.com");
     seed_user(&s, "Clarke 2", "clarke@gmail.com");
     s.check_query_f(&format!("{SYNC}/get_users_by_email_success.yaml"), Transport::Http);
+
+    // get_user_by_email_nested: nested custom objects (no table relationship),
+    // shaped from the webhook around the engine-fetched id.
+    reset_users(&s);
+    seed_user(&s, "Clarke", "clarke@gmail.com");
+    s.check_query_f(&format!("{SYNC}/get_user_by_email_nested_success.yaml"), Transport::Http);
 }

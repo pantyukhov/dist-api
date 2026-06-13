@@ -1,3 +1,7 @@
+# Ported from tests-py, with the final `get_user_by_email_nested_transformed`
+# step dropped (response (Kriti) transforms are out of scope — see
+# tests/hasura/COVERAGE.md). The remaining steps need no output relationship:
+# user_id/address/addresses are plain custom objects shaped from the webhook.
 - description: Run get_user_by_email_nested query action with valid email, the response should be an object
   url: /v1/graphql
   status: 200
@@ -189,31 +193,3 @@
           my_city: New York
           my_country: USA
 
-- description: Run get_user_by_email_nested_transformed query action with valid email, the response should be an object
-  url: /v1/graphql
-  status: 200
-  query:
-    query: |
-      query ($email: String!){
-        get_user_by_email_nested_transformed(email: $email){
-            uid
-            city0
-            country0
-            other_addresses {
-              city
-              country
-            }
-        }
-      }
-    variables:
-      email: clarke@gmail.com
-  response:
-    data:
-      get_user_by_email_nested_transformed:
-        uid: 1
-        city0: Bangalore
-        country0: India
-        other_addresses:
-          - ~
-          - city: Melbourne
-            country: Australia
