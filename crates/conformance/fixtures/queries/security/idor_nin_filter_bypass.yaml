@@ -1,0 +1,17 @@
+description: A _nin filter cannot widen access beyond the permission's owner check
+url: /v1/graphql
+status: 200
+headers:
+  X-Hasura-Role: user
+  X-Hasura-User-Id: '1'
+query:
+  query: |
+    query {
+      account(where: {owner: {_nin: ["1"]}}) {
+        id
+        owner
+      }
+    }
+response:
+  data:
+    account: []

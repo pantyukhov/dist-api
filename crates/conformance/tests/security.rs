@@ -24,6 +24,8 @@ fn security_access_control_and_injection() {
         "idor_list_only_own.yaml",
         "idor_where_other_owner.yaml",
         "idor_or_filter_bypass.yaml",
+        "idor_neq_filter_bypass.yaml",
+        "idor_nin_filter_bypass.yaml",
         "idor_by_pk_other.yaml",
         "idor_aggregate_no_leak.yaml",
         "idor_via_relationship.yaml",
