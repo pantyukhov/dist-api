@@ -1,0 +1,25 @@
+description: Aggregates respect the row permission and never sum another owner's data
+url: /v1/graphql
+status: 200
+headers:
+  X-Hasura-Role: user
+  X-Hasura-User-Id: '1'
+query:
+  query: |
+    query {
+      account_aggregate {
+        aggregate {
+          count
+          sum {
+            balance
+          }
+        }
+      }
+    }
+response:
+  data:
+    account_aggregate:
+      aggregate:
+        count: 2
+        sum:
+          balance: 600

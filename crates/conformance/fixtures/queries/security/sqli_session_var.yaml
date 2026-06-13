@@ -1,0 +1,17 @@
+description: An injection payload in a session variable is escaped into the permission filter, leaking nothing
+url: /v1/graphql
+status: 200
+headers:
+  X-Hasura-Role: user
+  X-Hasura-User-Id: "1' OR '1'='1"
+query:
+  query: |
+    query {
+      account {
+        id
+        owner
+      }
+    }
+response:
+  data:
+    account: []

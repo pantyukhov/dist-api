@@ -1,0 +1,140 @@
+# Attack-coverage suite: row/column/table-level access control and SQL
+# injection. A multi-tenant schema where a row's `owner` must equal the
+# caller's X-Hasura-User-Id. There is NO admin role in this engine, so every
+# request below runs as the `user` role scoped strictly by these permissions.
+#
+# account.secret_pin is column-level hidden from `user`; the audit_log table is
+# table-level hidden (only the `manager` role can see it). memo is reachable
+# only through the account it belongs to (relationship-scoped permission).
+type: bulk
+args:
+  - type: run_sql
+    args:
+      sql: |
+        CREATE TABLE account (
+          id         serial PRIMARY KEY,
+          owner      text NOT NULL,        -- = X-Hasura-User-Id
+          label      text NOT NULL,
+          balance    integer NOT NULL DEFAULT 0,
+          secret_pin text                  -- hidden from the user select perm
+        );
+        CREATE TABLE memo (
+          id         serial PRIMARY KEY,
+          account_id integer NOT NULL REFERENCES account (id),
+          body       text NOT NULL
+        );
+        CREATE TABLE audit_log (           -- no `user` permission at all
+          id      serial PRIMARY KEY,
+          message text NOT NULL
+        );
+
+        INSERT INTO account (owner, label, balance, secret_pin) VALUES
+          ('1', 'Alice main',    100, 'pin-1111'),   -- id 1
+          ('1', 'Alice savings', 500, 'pin-2222'),   -- id 2
+          ('2', 'Bob main',     9000, 'pin-9999');   -- id 3
+
+        INSERT INTO memo (account_id, body) VALUES
+          (1, 'Alice private memo'),                 -- belongs to owner 1
+          (3, 'Bob private memo');                   -- belongs to owner 2
+
+        INSERT INTO audit_log (message) VALUES
+          ('system started'), ('nightly backup ok');
+
+  - type: track_table
+    args: { schema: public, name: account }
+  - type: track_table
+    args: { schema: public, name: memo }
+  - type: track_table
+    args: { schema: public, name: audit_log }
+
+  # account <-> memo relationships
+  - type: create_array_relationship
+    args:
+      table: account
+      name: memos
+      using:
+        foreign_key_constraint_on:
+          table: memo
+          column: account_id
+  - type: create_object_relationship
+    args:
+      table: memo
+      name: account
+      using:
+        foreign_key_constraint_on: account_id
+
+  # ---- role `user` permissions, scoped to own rows ----
+  - type: create_select_permission
+    args:
+      table: account
+      role: user
+      permission:
+        # secret_pin deliberately excluded (column-level access control)
+        columns: [id, owner, label, balance]
+        filter:
+          owner:
+            _eq: X-Hasura-User-Id
+        allow_aggregations: true
+  - type: create_insert_permission
+    args:
+      table: account
+      role: user
+      permission:
+        # owner is NOT settable; it is forced by the preset below
+        columns: [label, balance]
+        check:
+          owner:
+            _eq: X-Hasura-User-Id
+        set:
+          owner: X-Hasura-User-Id
+  - type: create_update_permission
+    args:
+      table: account
+      role: user
+      permission:
+        columns: [label, balance]
+        filter:
+          owner:
+            _eq: X-Hasura-User-Id
+        check:
+          owner:
+            _eq: X-Hasura-User-Id
+  - type: create_delete_permission
+    args:
+      table: account
+      role: user
+      permission:
+        filter:
+          owner:
+            _eq: X-Hasura-User-Id
+
+  # memo: reachable only via an account the caller owns (relationship filter)
+  - type: create_select_permission
+    args:
+      table: memo
+      role: user
+      permission:
+        columns: [id, account_id, body]
+        filter:
+          account:
+            owner:
+              _eq: X-Hasura-User-Id
+  - type: create_insert_permission
+    args:
+      table: memo
+      role: user
+      permission:
+        columns: [account_id, body]
+        check:
+          account:
+            owner:
+              _eq: X-Hasura-User-Id
+
+  # audit_log is visible only to `manager`, never to `user`
+  - type: create_select_permission
+    args:
+      table: audit_log
+      role: manager
+      permission:
+        columns: [id, message]
+        filter: {}

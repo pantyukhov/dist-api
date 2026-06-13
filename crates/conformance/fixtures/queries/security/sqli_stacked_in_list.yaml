@@ -1,0 +1,41 @@
+# Stacked-statement payload inside an _in list. The value is escaped to a
+# literal, so it matches nothing AND the table is not dropped (step [1] reads a
+# seeded row back). A two-step fixture: attack, then prove the table survived.
+- description: Stacked-query payload in an _in list matches nothing and does not execute
+  url: /v1/graphql
+  status: 200
+  headers:
+    X-Hasura-Role: user
+    X-Hasura-User-Id: '1'
+  query:
+    query: |
+      query {
+        account(where: {label: {_in: ["nope", "x'); DROP TABLE account; --"]}}) {
+          id
+        }
+      }
+  response:
+    data:
+      account: []
+
+- description: The account table still exists after the stacked-query attempt
+  url: /v1/graphql
+  status: 200
+  headers:
+    X-Hasura-Role: user
+    X-Hasura-User-Id: '1'
+  query:
+    query: |
+      query {
+        account_by_pk(id: 1) {
+          id
+          owner
+          label
+        }
+      }
+  response:
+    data:
+      account_by_pk:
+        id: 1
+        owner: '1'
+        label: Alice main

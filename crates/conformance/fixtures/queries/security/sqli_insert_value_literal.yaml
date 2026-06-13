@@ -1,0 +1,44 @@
+# An injection payload as an inserted value is stored/returned verbatim and
+# does not execute. Two steps: insert the payload (echoed back exactly), then
+# confirm a seeded row still exists (the table was not dropped).
+- description: A drop-table payload inserted as a value is stored as a literal string
+  url: /v1/graphql
+  status: 200
+  headers:
+    X-Hasura-Role: user
+    X-Hasura-User-Id: '1'
+  query:
+    variables:
+      label: 'Robert''); DROP TABLE account;--'
+    query: |
+      mutation ($label: String!) {
+        insert_account_one(object: {label: $label, balance: 1}) {
+          owner
+          label
+        }
+      }
+  response:
+    data:
+      insert_account_one:
+        owner: '1'
+        label: 'Robert''); DROP TABLE account;--'
+
+- description: The account table still exists after the insert-payload attempt
+  url: /v1/graphql
+  status: 200
+  headers:
+    X-Hasura-Role: user
+    X-Hasura-User-Id: '1'
+  query:
+    query: |
+      query {
+        account_by_pk(id: 1) {
+          id
+          owner
+        }
+      }
+  response:
+    data:
+      account_by_pk:
+        id: 1
+        owner: '1'

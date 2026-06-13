@@ -1,0 +1,18 @@
+description: Fetching another owner's row by primary key returns null, not the row
+url: /v1/graphql
+status: 200
+headers:
+  X-Hasura-Role: user
+  X-Hasura-User-Id: '1'
+query:
+  query: |
+    query {
+      account_by_pk(id: 3) {
+        id
+        owner
+        label
+      }
+    }
+response:
+  data:
+    account_by_pk: null

@@ -1,0 +1,17 @@
+description: A classic boolean-injection payload in a string filter is treated as a literal, matching nothing
+url: /v1/graphql
+status: 200
+headers:
+  X-Hasura-Role: user
+  X-Hasura-User-Id: '1'
+query:
+  query: |
+    query {
+      account(where: {label: {_eq: "x' OR '1'='1"}}) {
+        id
+        label
+      }
+    }
+response:
+  data:
+    account: []

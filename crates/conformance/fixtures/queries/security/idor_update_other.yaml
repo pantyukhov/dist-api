@@ -1,0 +1,21 @@
+description: Updating another owner's row affects zero rows (row permission on update)
+url: /v1/graphql
+status: 200
+headers:
+  X-Hasura-Role: user
+  X-Hasura-User-Id: '1'
+query:
+  query: |
+    mutation {
+      update_account(where: {id: {_eq: 3}}, _set: {label: "hacked"}) {
+        affected_rows
+        returning {
+          id
+        }
+      }
+    }
+response:
+  data:
+    update_account:
+      affected_rows: 0
+      returning: []

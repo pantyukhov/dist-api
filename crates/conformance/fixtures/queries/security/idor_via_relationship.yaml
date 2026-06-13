@@ -1,0 +1,24 @@
+description: Traversing a relationship does not leak another owner's child rows
+url: /v1/graphql
+status: 200
+headers:
+  X-Hasura-Role: user
+  X-Hasura-User-Id: '1'
+query:
+  query: |
+    query {
+      memo(order_by: {id: asc}) {
+        id
+        body
+        account {
+          owner
+        }
+      }
+    }
+response:
+  data:
+    memo:
+      - id: 1
+        body: Alice private memo
+        account:
+          owner: '1'

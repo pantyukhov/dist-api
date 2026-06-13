@@ -1,0 +1,21 @@
+description: Quote- and backslash-heavy values round-trip verbatim (quote doubling; backslashes inert under standard_conforming_strings)
+url: /v1/graphql
+status: 200
+headers:
+  X-Hasura-Role: user
+  X-Hasura-User-Id: '1'
+query:
+  variables:
+    label: 'O''Brien \ "quote" '''
+  query: |
+    mutation ($label: String!) {
+      insert_account_one(object: {label: $label, balance: 3}) {
+        owner
+        label
+      }
+    }
+response:
+  data:
+    insert_account_one:
+      owner: '1'
+      label: 'O''Brien \ "quote" '''

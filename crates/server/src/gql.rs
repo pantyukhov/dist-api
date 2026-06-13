@@ -562,9 +562,17 @@ pub async fn execute_full(
                 match tx.query_one(&sql, &[]).await {
                     Ok(row) => {
                         // Typename roots produce text, everything else json.
+                        // A by-pk mutation that matches no row (e.g. blocked by
+                        // the update/delete permission filter) yields a SQL
+                        // NULL in column 0 — decode as Option so it becomes a
+                        // JSON null, not a decode error.
                         let value = row
-                            .try_get::<_, Json>(0)
-                            .or_else(|_| row.try_get::<_, String>(0).map(Json::String));
+                            .try_get::<_, Option<Json>>(0)
+                            .map(|o| o.unwrap_or(Json::Null))
+                            .or_else(|_| {
+                                row.try_get::<_, Option<String>>(0)
+                                    .map(|o| o.map(Json::String).unwrap_or(Json::Null))
+                            });
                         match value {
                             Ok(v) => {
                                 data.insert(alias, v);

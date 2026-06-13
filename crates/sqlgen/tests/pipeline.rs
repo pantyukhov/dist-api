@@ -213,6 +213,56 @@ fn string_literals_are_escaped() {
 }
 
 #[test]
+fn injection_payload_in_where_eq_is_escaped() {
+    // Classic boolean-injection payload through a string filter.
+    let sql = plan_sql(r#"query { article(where: { title: { _eq: "x' OR '1'='1" } }) { id } }"#);
+    assert!(sql.contains("'x'' OR ''1''=''1'"), "payload not doubled in: {sql}");
+    assert!(!sql.contains("'x' OR '1'='1'"), "raw breakout leaked into: {sql}");
+}
+
+#[test]
+fn injection_payload_in_like_pattern_is_escaped() {
+    let sql = plan_sql(r#"query { article(where: { title: { _like: "%' OR '1'='1%" } }) { id } }"#);
+    assert!(sql.contains("'%'' OR ''1''=''1%'"), "payload not doubled in: {sql}");
+    assert!(!sql.contains("'%' OR '1'='1%'"), "raw breakout leaked into: {sql}");
+}
+
+#[test]
+fn injection_stacked_statement_in_in_list_is_escaped() {
+    // A stacked-query payload inside an _in list must stay a single quoted
+    // literal: the opening quote of the next "statement" is doubled, so it
+    // never closes the literal.
+    let sql = plan_sql(
+        r#"query { article(where: { title: { _in: ["a", "b'); DROP TABLE article; --"] } }) { id } }"#,
+    );
+    assert!(
+        sql.contains("'b''); DROP TABLE article; --'"),
+        "payload not doubled in: {sql}"
+    );
+    assert!(
+        !sql.contains("'b'); DROP TABLE article; --"),
+        "raw quote breakout leaked into: {sql}"
+    );
+}
+
+#[test]
+fn injection_payload_in_session_var_is_escaped() {
+    // A session-variable value flows into the permission filter; an injection
+    // payload there must be quoted, not break out of the literal.
+    let session = Session {
+        role: "user".into(),
+        vars: std::collections::HashMap::from([(
+            "x-hasura-user-id".to_string(),
+            "1' OR '1'='1".to_string(),
+        )]),
+        backend_request: false,
+    };
+    let sql = plan_sql_with("query { article { id } }", &session);
+    assert!(sql.contains("'1'' OR ''1''=''1'"), "session var not doubled in: {sql}");
+    assert!(!sql.contains("'1' OR '1'='1'"), "raw breakout leaked into: {sql}");
+}
+
+#[test]
 fn unknown_role_sees_nothing() {
     let session = Session {
         role: "stranger".into(),

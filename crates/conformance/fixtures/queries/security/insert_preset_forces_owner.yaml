@@ -1,0 +1,21 @@
+description: On insert the owner is forced to the session user by the preset, not chosen by the caller
+url: /v1/graphql
+status: 200
+headers:
+  X-Hasura-Role: user
+  X-Hasura-User-Id: '1'
+query:
+  query: |
+    mutation {
+      insert_account_one(object: {label: "preset check", balance: 7}) {
+        owner
+        label
+        balance
+      }
+    }
+response:
+  data:
+    insert_account_one:
+      owner: '1'
+      label: preset check
+      balance: 7

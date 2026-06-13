@@ -1,0 +1,8 @@
+type: bulk
+args:
+  - type: run_sql
+    args:
+      sql: |
+        DROP TABLE IF EXISTS memo;
+        DROP TABLE IF EXISTS audit_log;
+        DROP TABLE IF EXISTS account;

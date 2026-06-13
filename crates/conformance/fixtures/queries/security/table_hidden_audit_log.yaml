@@ -1,0 +1,20 @@
+description: A table with no permission for the role is not exposed (table-level)
+url: /v1/graphql
+status: 200
+headers:
+  X-Hasura-Role: user
+  X-Hasura-User-Id: '1'
+response:
+  errors:
+    - extensions:
+        path: $.selectionSet.audit_log
+        code: validation-failed
+      message: "field 'audit_log' not found in type: 'query_root'"
+query:
+  query: |
+    query {
+      audit_log {
+        id
+        message
+      }
+    }
